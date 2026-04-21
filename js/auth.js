@@ -2,7 +2,7 @@
    auth.js — Lógica de autenticación (login page)
    ============================================================ */
 
-const API_BASE = 'http://localhost:8000'; // Ajustar según despliegue
+const API_BASE = 'https://airlink-sitem-semgas-upb.onrender.com'; // Ajustar según despliegue
 
 // ── Particles animation ──────────────────────────────────────
 (function initParticles() {
