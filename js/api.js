@@ -2,8 +2,7 @@
    api.js — Capa de comunicación con el backend FastAPI
    ============================================================ */
 
-// const API_BASE = 'https://airlink-sitem-semgas-upb.onrender.com'; // Ajustar según despliegue
-const API_BASE = 'http://localhost:8000';
+const API_BASE = 'https://airlink-sitem-semgas-upb.onrender.com'; // Ajustar según despliegue
 
 // ── Auth guard: si no hay token, redirigir al login ───────────
 const _token = sessionStorage.getItem('al_token');
