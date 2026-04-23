@@ -46,10 +46,22 @@ const btnPrevRange = document.getElementById('btnPrevRange');
 const btnNextRange = document.getElementById('btnNextRange');
 const paginationLabel = document.getElementById('paginationLabel');
 
-function updatePaginationLabel() {
+function updatePaginationLabel(startDt, endDt) {
   if (!paginationLabel) return;
-  const labels = { '1h': 'Desplazar 1H', '6h': 'Desplazar 6H', '12h': 'Desplazar 12H', '24h': 'Día Anterior/Sig.', '7d': 'Semana Anterior/Sig.' };
-  paginationLabel.textContent = labels[currentRange] || `Desplazar ${currentRange.toUpperCase()}`;
+  const labels = { '2h': 'Mover 2H', '6h': 'Mover 6H', '12h': 'Mover 12H', '24h': 'Día Anterior/Sig.', '7d': 'Semana Anterior/Sig.' };
+  let text = labels[currentRange] || `Desplazar ${currentRange.toUpperCase()}`;
+  
+  if (startDt && endDt) {
+    if (currentRange === '7d') {
+      const sStr = startDt.toLocaleDateString('es-ES', { day: '2-digit', month: 'short' });
+      const eStr = endDt.toLocaleDateString('es-ES', { day: '2-digit', month: 'short' });
+      text = `${sStr} al ${eStr}  •  ${text}`;
+    } else {
+      const dStr = startDt.toLocaleDateString('es-ES', { day: '2-digit', month: 'short', year: 'numeric' });
+      text = `${dStr}  •  ${text}`;
+    }
+  }
+  paginationLabel.textContent = text;
 }
 
 // ── Helpers ───────────────────────────────────────────────────
@@ -113,10 +125,18 @@ function getWindowDates(range, offset) {
     start = new Date(currentMonday.getFullYear(), currentMonday.getMonth(), currentMonday.getDate() - (offset * 7), 0, 0, 0);
     end = new Date(start.getFullYear(), start.getMonth(), start.getDate() + 6, 23, 59, 59, 999);
   } else {
-    const map = { '1h': 1, '6h': 6, '12h': 12 };
-    const hours = map[range] || 1;
-    end = new Date(now.getTime() - (offset * hours * 3600000));
-    start = new Date(end.getTime() - (hours * 3600000));
+    const map = { '2h': 1, '6h': 6, '12h': 12 };
+    const backHours = map[range] || 1;
+    const shiftHours = (range === '12h') ? 12 : (range === '6h') ? 6 : 2;
+    
+    const baseHour = now.getHours();
+    
+    const windowEndHour = baseHour + 1 - (offset * shiftHours);
+    end = new Date(now.getFullYear(), now.getMonth(), now.getDate(), windowEndHour, 0, 0);
+    end = new Date(end.getTime() - 1); 
+    
+    const windowStartHour = baseHour - backHours - (offset * shiftHours);
+    start = new Date(now.getFullYear(), now.getMonth(), now.getDate(), windowStartHour, 0, 0);
   }
   
   return { start, end };
@@ -149,7 +169,8 @@ async function getCachedReadings(startDt, endDt) {
     });
   }
 
-  const fetchStartDt = new Date(startMs - 7 * 24 * 3600 * 1000); 
+  const paddingDays = currentRange === '7d' ? 7 : 2;
+  const fetchStartDt = new Date(startMs - paddingDays * 24 * 3600 * 1000); 
   const fetchEndDt = new Date(endMs + 1 * 24 * 3600 * 1000); 
   
   const toUTCISO = (localD) => {
@@ -212,20 +233,35 @@ function updateCards(latestReading, datasets) {
 
 // ── Opciones base del eje de tiempo ──────────────────────────
 function timeScaleOptions(range, startDt, endDt) {
-  const unitMap = { '1h': 'minute', '6h': 'hour', '12h': 'hour', '24h': 'hour', '7d': 'day' };
-  const stepMap = { '1h': 10, '6h': 1, '12h': 2, '24h': 3, '7d': 1 };
+  let unit, stepSize;
+  
+  if (range === '2h') {
+    unit = 'minute';
+    stepSize = 10;
+  } else if (range === '6h' || range === '12h' || range === '24h') {
+    unit = 'hour';
+    stepSize = (range === '24h') ? 3 : 1;
+  } else {
+    unit = 'day';
+    stepSize = 1;
+  }
+
   return {
     type: 'time',
     min: startDt,
     max: endDt,
     time: {
-      unit: unitMap[range] || 'hour',
-      stepSize: stepMap[range] || 1,
+      unit: unit,
+      stepSize: stepSize,
       displayFormats: { minute: 'HH:mm', hour: 'HH:mm', day: 'dd/MM' },
       tooltipFormat: 'dd/MM/yyyy HH:mm',
     },
     grid: { color: getThemeColor('--border-light') },
-    ticks: { color: getThemeColor('--text-2'), maxRotation: 0 },
+    ticks: { 
+      color: getThemeColor('--text-2'), 
+      maxRotation: 0,
+      autoSkip: (range !== '2h') // Forza que no se oculten las marcas de 10 mins en 2H
+    },
   };
 }
 
@@ -361,6 +397,8 @@ async function loadData() {
     }
 
     const { start, end } = getWindowDates(currentRange, offsetUnits);
+    updatePaginationLabel(start, end);
+
     let readings = await getCachedReadings(start, end);
     const latest = await fetchLatest();
 
@@ -414,7 +452,6 @@ document.querySelectorAll('.tab-btn').forEach(btn => {
     currentRange = e.target.getAttribute('data-range');
     offsetUnits = 0; 
     btnNextRange.disabled = true;
-    updatePaginationLabel();
     
     loadData();
   });
@@ -432,6 +469,28 @@ if (btnNextRange) {
   btnNextRange.addEventListener('click', () => {
     offsetUnits = Math.max(0, offsetUnits - 1);
     if (offsetUnits === 0) btnNextRange.disabled = true;
+    loadData();
+  });
+}
+
+const btnGoPresent = document.getElementById('btnGoPresent');
+if (btnGoPresent) {
+  btnGoPresent.addEventListener('click', () => {
+    if (currentRange === '24h' && offsetUnits === 0) return; // Ya estamos ahí
+    
+    document.querySelectorAll('.tab-btn').forEach(b => {
+      b.classList.remove('active');
+      b.setAttribute('aria-selected', 'false');
+      if (b.getAttribute('data-range') === '24h') {
+        b.classList.add('active');
+        b.setAttribute('aria-selected', 'true');
+      }
+    });
+
+    currentRange = '24h';
+    offsetUnits = 0;
+    btnNextRange.disabled = true;
+    
     loadData();
   });
 }
@@ -564,6 +623,5 @@ function startAutoRefresh() {
   }, REFRESH_MS);
 }
 
-updatePaginationLabel();
 loadData();
 startAutoRefresh();
