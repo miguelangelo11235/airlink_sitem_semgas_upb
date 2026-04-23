@@ -202,19 +202,35 @@ def login(req: LoginRequest):
 @app.get("/readings")
 def get_readings(
     range: str = "24h",
+    start: Optional[str] = None,
+    end: Optional[str] = None,
     username: str = Depends(verify_token),
 ):
     """
-    Retorna lecturas ordenadas ascendente dentro del rango solicitado.
-    Query param: range = '1h' | '6h' | '24h' | '7d'
+    Retorna lecturas ordenadas ascendente.
+    Puede usar 'range' ('1h', '6h', '12h', '24h', '7d') o 'start' y 'end' en formato ISO.
     """
-    delta = RANGE_MAP.get(range, timedelta(hours=24))
-    since = datetime.now(timezone.utc) - delta
+    query = {}
+    
+    if start and end:
+        try:
+            start_dt = datetime.fromisoformat(start.replace("Z", "+00:00"))
+            end_dt = datetime.fromisoformat(end.replace("Z", "+00:00"))
+            query = {"timestamp": {"$gte": start_dt, "$lte": end_dt}}
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Formato de fecha inválido")
+    else:
+        # Backward compatibility o uso de 'range' con desplazamiento
+        # Si agregamos 12h:
+        RANGE_MAP["12h"] = timedelta(hours=12)
+        delta = RANGE_MAP.get(range, timedelta(hours=24))
+        since = datetime.now(timezone.utc) - delta
+        query = {"timestamp": {"$gte": since}}
 
     cursor = (
         get_db()[_config["readings_collection"]]
         .find(
-            {"timestamp": {"$gte": since}},
+            query,
             {"_id": 0, "timestamp": 1, "device_id": 1, "metrics": 1},
         )
         .sort("timestamp", 1)
@@ -222,9 +238,23 @@ def get_readings(
 
     readings = []
     for doc in cursor:
-        doc["timestamp"] = doc["timestamp"].isoformat()
+        if isinstance(doc["timestamp"], datetime):
+            doc["timestamp"] = doc["timestamp"].isoformat()
         readings.append(doc)
     return readings
+
+@app.get("/readings/range")
+def get_readings_range(username: str = Depends(verify_token)):
+    """Retorna la fecha de la lectura más antigua y la más reciente."""
+    coll = get_db()[_config["readings_collection"]]
+    
+    oldest = coll.find_one({}, {"_id": 0, "timestamp": 1}, sort=[("timestamp", 1)])
+    newest = coll.find_one({}, {"_id": 0, "timestamp": 1}, sort=[("timestamp", DESCENDING)])
+    
+    return {
+        "min": oldest["timestamp"].isoformat() if oldest and isinstance(oldest.get("timestamp"), datetime) else None,
+        "max": newest["timestamp"].isoformat() if newest and isinstance(newest.get("timestamp"), datetime) else None
+    }
 
 
 @app.get("/latest")

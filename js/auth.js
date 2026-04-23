@@ -2,7 +2,8 @@
    auth.js — Lógica de autenticación (login page)
    ============================================================ */
 
-const API_BASE = 'https://airlink-sitem-semgas-upb.onrender.com'; // Ajustar según despliegue
+//const API_BASE = 'https://airlink-sitem-semgas-upb.onrender.com'; // Ajustar según despliegue
+const API_BASE = 'http://localhost:8000';
 
 // ── Particles animation ──────────────────────────────────────
 (function initParticles() {
@@ -24,13 +25,13 @@ const API_BASE = 'https://airlink-sitem-semgas-upb.onrender.com'; // Ajustar seg
 })();
 
 // ── DOM refs ─────────────────────────────────────────────────
-const form     = document.getElementById('loginForm');
+const form = document.getElementById('loginForm');
 const btnLogin = document.getElementById('btnLogin');
-const btnText  = btnLogin.querySelector('.btn-text');
+const btnText = btnLogin.querySelector('.btn-text');
 const btnSpinner = btnLogin.querySelector('.btn-spinner');
 const errorMsg = document.getElementById('errorMsg');
 const togglePwd = document.getElementById('togglePwd');
-const pwdInput  = document.getElementById('password');
+const pwdInput = document.getElementById('password');
 
 // ── Toggle password visibility ───────────────────────────────
 togglePwd.addEventListener('click', () => {
@@ -51,7 +52,7 @@ function hideError() {
 // ── Loading state ─────────────────────────────────────────────
 function setLoading(loading) {
   btnLogin.disabled = loading;
-  btnText.hidden    = loading;
+  btnText.hidden = loading;
   btnSpinner.hidden = !loading;
 }
 
@@ -81,7 +82,7 @@ form.addEventListener('submit', async (e) => {
       const data = await res.json();
       // Guardar token y usuario en sessionStorage
       sessionStorage.setItem('al_token', data.token);
-      sessionStorage.setItem('al_user',  username);
+      sessionStorage.setItem('al_user', username);
       // Redirigir al dashboard
       window.location.href = 'dashboard.html';
     } else {

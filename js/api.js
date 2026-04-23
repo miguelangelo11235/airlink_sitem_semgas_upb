@@ -2,7 +2,8 @@
    api.js — Capa de comunicación con el backend FastAPI
    ============================================================ */
 
-const API_BASE = 'https://airlink-sitem-semgas-upb.onrender.com'; // Ajustar según despliegue
+// const API_BASE = 'https://airlink-sitem-semgas-upb.onrender.com'; // Ajustar según despliegue
+const API_BASE = 'http://localhost:8000';
 
 // ── Auth guard: si no hay token, redirigir al login ───────────
 const _token = sessionStorage.getItem('al_token');
@@ -28,11 +29,17 @@ function logout() {
 // ── Obtener lecturas ──────────────────────────────────────────
 /**
  * Obtiene lecturas del backend.
- * @param {string} range — '1h' | '6h' | '24h' | '7d'
+ * @param {string} range — '1h' | '6h' | '12h' | '24h' | '7d'
+ * @param {string} start — ISO string para fecha de inicio
+ * @param {string} end — ISO string para fecha de fin
  * @returns {Promise<Array>} Array de documentos con timestamp + metrics
  */
-async function fetchReadings(range = '24h') {
-  const res = await fetch(`${API_BASE}/readings?range=${range}`, {
+async function fetchReadings(range = '24h', start = null, end = null) {
+  let url = `${API_BASE}/readings?range=${range}`;
+  if (start && end) {
+    url = `${API_BASE}/readings?start=${encodeURIComponent(start)}&end=${encodeURIComponent(end)}`;
+  }
+  const res = await fetch(url, {
     headers: authHeaders(),
   });
 
@@ -45,6 +52,21 @@ async function fetchReadings(range = '24h') {
     throw new Error(`Error al obtener lecturas: ${res.status}`);
   }
 
+  return res.json();
+}
+
+// ── Rango de Fechas Totales ──────────────────────────────────
+async function fetchReadingsRange() {
+  const res = await fetch(`${API_BASE}/readings/range`, {
+    headers: authHeaders(),
+  });
+
+  if (res.status === 401) {
+    logout();
+    return null;
+  }
+
+  if (!res.ok) return null;
   return res.json();
 }
 

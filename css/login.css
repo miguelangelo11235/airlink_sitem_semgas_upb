@@ -19,10 +19,25 @@
   --text-3:      #3f4758;
   --danger:      #ff5252;
   --danger-bg:   rgba(255,82,82,0.10);
-  --radius:      12px;
-  --font-hd:     'Barlow Condensed', sans-serif;
-  --font-body:   'Barlow', sans-serif;
+  --radius:      8px;
+  --font-body:   'Inter', sans-serif;
   --transition:  0.22s cubic-bezier(.4,0,.2,1);
+}
+
+body.light-mode {
+  --bg:          #f3f2f1;
+  --bg-card:     #ffffff;
+  --bg-input:    #ffffff;
+  --border:      #e1dfdd;
+  --border-focus:#118dff;
+  --accent:      #118dff;
+  --accent-dim:  rgba(17,141,255,0.1);
+  --accent-glow: rgba(17,141,255,0.2);
+  --text-1:      #252423;
+  --text-2:      #605e5c;
+  --text-3:      #a19f9d;
+  --danger:      #d64550;
+  --danger-bg:   rgba(214,69,80,0.1);
 }
 
 html, body {

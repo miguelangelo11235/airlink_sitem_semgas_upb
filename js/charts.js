@@ -1,15 +1,21 @@
 /* ============================================================
    charts.js — Lógica principal del dashboard AirLink
-   Dependencias: Chart.js 4 + chartjs-adapter-date-fns (CDN)
    ============================================================ */
 
 // ── Estado ────────────────────────────────────────────────────
 let currentRange  = '24h';
+let offsetUnits   = 0; // 0 = actual, 1 = anterior, 2 = ...
 let pmChartInst   = null;
 let thChartInst   = null;
 let autoRefreshId = null;
-let currentReadings = []; // Para descargar CSV
-const REFRESH_MS  = 60_000; // Auto-refresh cada 60 segundos
+let useLocalTime  = true; // Por defecto UTC-5
+const REFRESH_MS  = 60_000; 
+
+// Caché local de lecturas
+let cachedData = [];
+let minCachedDate = null;
+let maxCachedDate = null;
+let dbGlobalRange = { min: null, max: null }; // Rango total en la BD
 
 // ── DOM refs ──────────────────────────────────────────────────
 const statusDot   = document.querySelector('.status-dot');
@@ -20,23 +26,34 @@ const pmOverlay   = document.getElementById('pmOverlay');
 const thOverlay   = document.getElementById('thOverlay');
 
 // Resumen cards
-const valTemp  = document.getElementById('valTemp');
-const valHum   = document.getElementById('valHum');
-const valPm1   = document.getElementById('valPm1');
-const valPm25  = document.getElementById('valPm25');
-const valPm10  = document.getElementById('valPm10');
+const valTemp  = document.getElementById('valTemp'), minTemp  = document.getElementById('minTemp'), maxTemp  = document.getElementById('maxTemp');
+const valHum   = document.getElementById('valHum'), minHum   = document.getElementById('minHum'), maxHum   = document.getElementById('maxHum');
+const valPm1   = document.getElementById('valPm1'), minPm1   = document.getElementById('minPm1'), maxPm1   = document.getElementById('maxPm1');
+const valPm25  = document.getElementById('valPm25'), minPm25  = document.getElementById('minPm25'), maxPm25  = document.getElementById('maxPm25');
+const valPm10  = document.getElementById('valPm10'), minPm10  = document.getElementById('minPm10'), maxPm10  = document.getElementById('maxPm10');
 
-// ── Chart.js defaults ─────────────────────────────────────────
-Chart.defaults.color         = '#7a8499';
-Chart.defaults.borderColor   = 'rgba(255,255,255,0.06)';
-Chart.defaults.font.family   = "'Barlow', sans-serif";
-Chart.defaults.font.size     = 11;
-Chart.defaults.plugins.legend.display = false;
+// Toggles
+const toggles = {
+  temp: document.getElementById('toggleTemp'),
+  hum: document.getElementById('toggleHum'),
+  pm1: document.getElementById('togglePm1'),
+  pm25: document.getElementById('togglePm25'),
+  pm10: document.getElementById('togglePm10')
+};
+
+// Navegación
+const btnPrevRange = document.getElementById('btnPrevRange');
+const btnNextRange = document.getElementById('btnNextRange');
+const paginationLabel = document.getElementById('paginationLabel');
+
+function updatePaginationLabel() {
+  if (!paginationLabel) return;
+  const labels = { '1h': 'Desplazar 1H', '6h': 'Desplazar 6H', '12h': 'Desplazar 12H', '24h': 'Día Anterior/Sig.', '7d': 'Semana Anterior/Sig.' };
+  paginationLabel.textContent = labels[currentRange] || `Desplazar ${currentRange.toUpperCase()}`;
+}
 
 // ── Helpers ───────────────────────────────────────────────────
-function fmt(v, dec = 1) {
-  return v != null ? Number(v).toFixed(dec) : '—';
-}
+function fmt(v, dec = 1) { return v != null ? Number(v).toFixed(dec) : '—'; }
 
 function setOverlay(overlay, visible) {
   overlay.classList.toggle('visible', visible);
@@ -49,242 +66,332 @@ function setStatus(online) {
 }
 
 function timestampToLocal(ts) {
-  // ts puede ser string ISO o un objeto con $date (MongoDB extended JSON)
   if (!ts) return null;
-  if (typeof ts === 'object' && ts.$date) return new Date(ts.$date);
-  return new Date(ts);
+  let d = (typeof ts === 'object' && ts.$date) ? new Date(ts.$date) : new Date(ts);
+  if (useLocalTime) {
+    d = new Date(d.getTime() - (5 * 60 * 60 * 1000));
+  }
+  return d;
 }
 
-// ── Construir datasets de Chart.js desde lecturas ─────────────
+// Obtiene los colores actuales del CSS
+function getThemeColor(varName) {
+  return getComputedStyle(document.body).getPropertyValue(varName).trim();
+}
+
+function updateChartTheme() {
+  Chart.defaults.color = getThemeColor('--text-2');
+  Chart.defaults.borderColor = getThemeColor('--border-light');
+  Chart.defaults.font.family = "'Inter', sans-serif";
+  Chart.defaults.plugins.legend.display = false;
+  
+  const applyTheme = (chart) => {
+    if(!chart) return;
+    chart.options.plugins.tooltip.backgroundColor = getThemeColor('--bg-card');
+    chart.options.plugins.tooltip.titleColor = getThemeColor('--text-1');
+    chart.options.plugins.tooltip.bodyColor = getThemeColor('--text-2');
+    chart.options.plugins.tooltip.borderColor = getThemeColor('--border');
+    chart.update();
+  };
+  applyTheme(pmChartInst);
+  applyTheme(thChartInst);
+}
+
+// ── Fechas y Rangos (Alineados a días/semanas) ───────────────
+function getWindowDates(range, offset) {
+  const now = new Date();
+  let start, end;
+  
+  if (range === '24h') {
+    start = new Date(now.getFullYear(), now.getMonth(), now.getDate() - offset, 0, 0, 0);
+    end = new Date(now.getFullYear(), now.getMonth(), now.getDate() - offset, 23, 59, 59, 999);
+  } else if (range === '7d') {
+    const dayOfWeek = now.getDay();
+    const diffToMonday = dayOfWeek === 0 ? -6 : 1 - dayOfWeek;
+    const currentMonday = new Date(now.getFullYear(), now.getMonth(), now.getDate() + diffToMonday, 0, 0, 0);
+    
+    start = new Date(currentMonday.getFullYear(), currentMonday.getMonth(), currentMonday.getDate() - (offset * 7), 0, 0, 0);
+    end = new Date(start.getFullYear(), start.getMonth(), start.getDate() + 6, 23, 59, 59, 999);
+  } else {
+    const map = { '1h': 1, '6h': 6, '12h': 12 };
+    const hours = map[range] || 1;
+    end = new Date(now.getTime() - (offset * hours * 3600000));
+    start = new Date(end.getTime() - (hours * 3600000));
+  }
+  
+  return { start, end };
+}
+
+// ── Downsample para 7D (Horas exactas) ────────────────────────
+function downsampleToHours(readings) {
+  const map = new Map();
+  for (const r of readings) {
+    const d = timestampToLocal(r.timestamp);
+    if (!d) continue;
+    d.setMinutes(0, 0, 0);
+    const key = d.getTime();
+    if (!map.has(key)) {
+      map.set(key, r);
+    }
+  }
+  return Array.from(map.values()).sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
+}
+
+// ── Caché Local de Datos ──────────────────────────────────────
+async function getCachedReadings(startDt, endDt) {
+  const startMs = startDt.getTime();
+  const endMs = endDt.getTime();
+  
+  if (minCachedDate && maxCachedDate && startMs >= minCachedDate && endMs <= maxCachedDate) {
+    return cachedData.filter(r => {
+      const t = timestampToLocal(r.timestamp).getTime();
+      return t >= startMs && t <= endMs;
+    });
+  }
+
+  const fetchStartDt = new Date(startMs - 7 * 24 * 3600 * 1000); 
+  const fetchEndDt = new Date(endMs + 1 * 24 * 3600 * 1000); 
+  
+  const toUTCISO = (localD) => {
+    return new Date(localD.getTime() + (useLocalTime ? 5*3600*1000 : 0)).toISOString();
+  };
+
+  const freshData = await fetchReadings('custom', toUTCISO(fetchStartDt), toUTCISO(fetchEndDt));
+  
+  const mergeMap = new Map();
+  cachedData.forEach(r => mergeMap.set(r.timestamp, r));
+  (freshData || []).forEach(r => mergeMap.set(r.timestamp, r));
+  
+  cachedData = Array.from(mergeMap.values()).sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
+  if (cachedData.length > 0) {
+    minCachedDate = timestampToLocal(cachedData[0].timestamp).getTime();
+    maxCachedDate = timestampToLocal(cachedData[cachedData.length - 1].timestamp).getTime();
+  }
+  
+  return cachedData.filter(r => {
+    const t = timestampToLocal(r.timestamp).getTime();
+    return t >= startMs && t <= endMs;
+  });
+}
+
+// ── Construir datasets ────────────────────────────────────────
 function buildDatasets(readings) {
   const labels = readings.map(r => timestampToLocal(r.timestamp));
-
   const pm1Data  = readings.map(r => r.metrics?.pm1  ?? null);
   const pm25Data = readings.map(r => r.metrics?.pm25  ?? null);
   const pm10Data = readings.map(r => r.metrics?.pm10  ?? null);
   const tempData = readings.map(r => r.metrics?.temperature_c ?? null);
   const humData  = readings.map(r => r.metrics?.humidity ?? null);
-
   return { labels, pm1Data, pm25Data, pm10Data, tempData, humData };
 }
 
+// ── Actualizar KPIs ───────────────────────────────────────────
+function getMinMax(arr) {
+  const valid = arr.filter(v => v !== null);
+  if (valid.length === 0) return { min: '—', max: '—' };
+  return { min: Math.min(...valid), max: Math.max(...valid) };
+}
+
+function updateCards(latestReading, datasets) {
+  if (!latestReading) return;
+  const m = latestReading.metrics || {};
+  valTemp.textContent  = fmt(m.temperature_c); valHum.textContent   = fmt(m.humidity);
+  valPm1.textContent   = fmt(m.pm1); valPm25.textContent  = fmt(m.pm25); valPm10.textContent  = fmt(m.pm10);
+
+  const tm = getMinMax(datasets.tempData);
+  minTemp.textContent = fmt(tm.min); maxTemp.textContent = fmt(tm.max);
+  const hm = getMinMax(datasets.humData);
+  minHum.textContent = fmt(hm.min); maxHum.textContent = fmt(hm.max);
+  const p1m = getMinMax(datasets.pm1Data);
+  minPm1.textContent = fmt(p1m.min); maxPm1.textContent = fmt(p1m.max);
+  const p25m = getMinMax(datasets.pm25Data);
+  minPm25.textContent = fmt(p25m.min); maxPm25.textContent = fmt(p25m.max);
+  const p10m = getMinMax(datasets.pm10Data);
+  minPm10.textContent = fmt(p10m.min); maxPm10.textContent = fmt(p10m.max);
+}
+
 // ── Opciones base del eje de tiempo ──────────────────────────
-function timeScaleOptions(range) {
-  const unitMap = { '1h': 'minute', '6h': 'hour', '24h': 'hour', '7d': 'day' };
-  const stepMap = { '1h': 10, '6h': 1, '24h': 2, '7d': 1 };
+function timeScaleOptions(range, startDt, endDt) {
+  const unitMap = { '1h': 'minute', '6h': 'hour', '12h': 'hour', '24h': 'hour', '7d': 'day' };
+  const stepMap = { '1h': 10, '6h': 1, '12h': 2, '24h': 3, '7d': 1 };
   return {
     type: 'time',
+    min: startDt,
+    max: endDt,
     time: {
       unit: unitMap[range] || 'hour',
       stepSize: stepMap[range] || 1,
-      displayFormats: {
-        minute: 'HH:mm',
-        hour:   'HH:mm',
-        day:    'dd/MM',
-      },
+      displayFormats: { minute: 'HH:mm', hour: 'HH:mm', day: 'dd/MM' },
       tooltipFormat: 'dd/MM/yyyy HH:mm',
     },
-    grid: { color: 'rgba(255,255,255,0.05)' },
-    ticks: { color: '#4a5568', maxRotation: 0 },
+    grid: { color: getThemeColor('--border-light') },
+    ticks: { color: getThemeColor('--text-2'), maxRotation: 0 },
   };
 }
 
 // ── Crear / actualizar gráfica de PM ──────────────────────────
-function renderPmChart(labels, pm1Data, pm25Data, pm10Data, range) {
+function renderPmChart(labels, pm1Data, pm25Data, pm10Data, range, startDt, endDt) {
   const ctx = document.getElementById('pmChart').getContext('2d');
-
   const commonDataset = (label, data, color) => ({
-    label,
-    data,
+    label, data,
     borderColor: color,
     backgroundColor: color + '18',
     borderWidth: 2,
-    pointRadius: data.length > 120 ? 0 : 3,
+    pointRadius: 0,
     pointHoverRadius: 5,
-    tension: 0.35,
+    tension: 0.2,
     fill: false,
-    spanGaps: true,
+    spanGaps: false,
   });
 
   const datasets = [
-    commonDataset('PM1',   pm1Data,  '#00bcd4'),
-    commonDataset('PM2.5', pm25Data, '#f9a825'),
-    commonDataset('PM10',  pm10Data, '#ef5350'),
+    commonDataset('PM1.0', pm1Data,  getThemeColor('--pm1')),
+    commonDataset('PM2.5', pm25Data, getThemeColor('--pm25')),
+    commonDataset('PM10',  pm10Data, getThemeColor('--pm10')),
   ];
 
   if (pmChartInst) {
-    pmChartInst.data.labels   = labels;
-    pmChartInst.data.datasets.forEach((ds, i) => { ds.data = datasets[i].data; });
-    pmChartInst.options.scales.x = timeScaleOptions(range);
-    pmChartInst.update('active');
-    return;
+    pmChartInst.data.labels = labels;
+    pmChartInst.data.datasets.forEach((ds, i) => { 
+      ds.data = datasets[i].data; 
+      ds.borderColor = datasets[i].borderColor;
+      ds.pointRadius = 0; 
+      ds.pointHoverRadius = 5;
+    });
+    pmChartInst.options.scales.x = timeScaleOptions(range, startDt, endDt);
+    pmChartInst.update('none');
+  } else {
+    pmChartInst = new Chart(ctx, {
+      type: 'line',
+      data: { labels, datasets },
+      options: {
+        responsive: true, maintainAspectRatio: false,
+        interaction: { mode: 'index', intersect: false },
+        plugins: {
+          legend: { display: true, position: 'top', labels: { color: getThemeColor('--text-1'), font: { family: "'Inter', sans-serif" } } },
+          tooltip: {
+            backgroundColor: getThemeColor('--bg-card'), titleColor: getThemeColor('--text-1'), bodyColor: getThemeColor('--text-2'),
+            borderColor: getThemeColor('--border'), borderWidth: 1,
+            callbacks: { label: ctx => ` ${ctx.dataset.label}: ${ctx.parsed.y != null ? ctx.parsed.y.toFixed(1) : '—'} µg/m³` }
+          }
+        },
+        scales: {
+          x: timeScaleOptions(range, startDt, endDt),
+          y: { title: { display: true, text: 'µg/m³', color: getThemeColor('--text-2'), font: { size: 10 } }, grid: { color: getThemeColor('--border-light') }, ticks: { color: getThemeColor('--text-2') }, beginAtZero: true },
+        },
+      },
+    });
   }
-
-  pmChartInst = new Chart(ctx, {
-    type: 'line',
-    data: { labels, datasets },
-    options: {
-      responsive: true,
-      maintainAspectRatio: false,
-      interaction: { mode: 'index', intersect: false },
-      plugins: {
-        tooltip: {
-          backgroundColor: '#111620',
-          borderColor: 'rgba(255,255,255,0.1)',
-          borderWidth: 1,
-          titleColor: '#e8edf5',
-          bodyColor: '#7a8499',
-          padding: 10,
-          callbacks: {
-            label: ctx => ` ${ctx.dataset.label}: ${ctx.parsed.y != null ? ctx.parsed.y.toFixed(1) : '—'} µg/m³`,
-          },
-        },
-      },
-      scales: {
-        x: timeScaleOptions(range),
-        y: {
-          title: { display: true, text: 'µg/m³', color: '#4a5568', font: { size: 10 } },
-          grid:  { color: 'rgba(255,255,255,0.05)' },
-          ticks: { color: '#4a5568' },
-          beginAtZero: true,
-        },
-      },
-    },
-  });
+  
+  if(toggles.pm1) pmChartInst.setDatasetVisibility(0, toggles.pm1.checked);
+  if(toggles.pm25) pmChartInst.setDatasetVisibility(1, toggles.pm25.checked);
+  if(toggles.pm10) pmChartInst.setDatasetVisibility(2, toggles.pm10.checked);
+  pmChartInst.update();
 }
 
 // ── Crear / actualizar gráfica de Temp + Humedad ──────────────
-function renderThChart(labels, tempData, humData, range) {
+function renderThChart(labels, tempData, humData, range, startDt, endDt) {
   const ctx = document.getElementById('thChart').getContext('2d');
-
   const datasets = [
     {
-      label: 'Temperatura',
-      data: tempData,
-      borderColor: '#ff7043',
-      backgroundColor: 'rgba(255,112,67,0.10)',
-      borderWidth: 2.2,
-      pointRadius: tempData.length > 120 ? 0 : 3,
-      pointHoverRadius: 5,
-      tension: 0.35,
-      fill: false,
-      yAxisID: 'yTemp',
-      spanGaps: true,
+      label: 'Temperatura', data: tempData,
+      borderColor: getThemeColor('--temp'), backgroundColor: getThemeColor('--temp') + '10',
+      borderWidth: 2, pointRadius: 0, pointHoverRadius: 5,
+      tension: 0.2, fill: false, yAxisID: 'yTemp', spanGaps: false,
     },
     {
-      label: 'Humedad',
-      data: humData,
-      borderColor: '#42a5f5',
-      backgroundColor: 'rgba(66,165,245,0.08)',
-      borderWidth: 2,
-      pointRadius: humData.length > 120 ? 0 : 3,
-      pointHoverRadius: 5,
-      tension: 0.35,
-      fill: false,
-      yAxisID: 'yHum',
-      spanGaps: true,
+      label: 'Humedad', data: humData,
+      borderColor: getThemeColor('--hum'), backgroundColor: getThemeColor('--hum') + '10',
+      borderWidth: 2, pointRadius: 0, pointHoverRadius: 5,
+      tension: 0.2, fill: false, yAxisID: 'yHum', spanGaps: false,
     },
   ];
 
   if (thChartInst) {
-    thChartInst.data.labels   = labels;
-    thChartInst.data.datasets.forEach((ds, i) => { ds.data = datasets[i].data; });
-    thChartInst.options.scales.x = timeScaleOptions(range);
-    thChartInst.update('active');
-    return;
-  }
-
-  thChartInst = new Chart(ctx, {
-    type: 'line',
-    data: { labels, datasets },
-    options: {
-      responsive: true,
-      maintainAspectRatio: false,
-      interaction: { mode: 'index', intersect: false },
-      plugins: {
-        tooltip: {
-          backgroundColor: '#111620',
-          borderColor: 'rgba(255,255,255,0.1)',
-          borderWidth: 1,
-          titleColor: '#e8edf5',
-          bodyColor: '#7a8499',
-          padding: 10,
-          callbacks: {
-            label: ctx => {
-              const unit = ctx.datasetIndex === 0 ? '°C' : '%';
-              return ` ${ctx.dataset.label}: ${ctx.parsed.y != null ? ctx.parsed.y.toFixed(1) : '—'} ${unit}`;
-            },
-          },
+    thChartInst.data.labels = labels;
+    thChartInst.data.datasets.forEach((ds, i) => { 
+      ds.data = datasets[i].data; 
+      ds.borderColor = datasets[i].borderColor; 
+      ds.pointRadius = 0;
+      ds.pointHoverRadius = 5;
+    });
+    thChartInst.options.scales.x = timeScaleOptions(range, startDt, endDt);
+    thChartInst.update('none');
+  } else {
+    thChartInst = new Chart(ctx, {
+      type: 'line',
+      data: { labels, datasets },
+      options: {
+        responsive: true, maintainAspectRatio: false,
+        interaction: { mode: 'index', intersect: false },
+        plugins: {
+          legend: { display: true, position: 'top', labels: { color: getThemeColor('--text-1'), font: { family: "'Inter', sans-serif" } } },
+          tooltip: {
+            backgroundColor: getThemeColor('--bg-card'), titleColor: getThemeColor('--text-1'), bodyColor: getThemeColor('--text-2'),
+            borderColor: getThemeColor('--border'), borderWidth: 1,
+            callbacks: { label: ctx => { const unit = ctx.datasetIndex === 0 ? '°C' : '%'; return ` ${ctx.dataset.label}: ${ctx.parsed.y != null ? ctx.parsed.y.toFixed(1) : '—'} ${unit}`; } }
+          }
+        },
+        scales: {
+          x: timeScaleOptions(range, startDt, endDt),
+          yTemp: { type: 'linear', position: 'left', title: { display: true, text: '°C', color: getThemeColor('--temp'), font: { size: 10 } }, grid: { color: getThemeColor('--border-light') }, ticks: { color: getThemeColor('--temp') } },
+          yHum: { type: 'linear', position: 'right', title: { display: true, text: '% HR', color: getThemeColor('--hum'), font: { size: 10 } }, grid: { drawOnChartArea: false }, ticks: { color: getThemeColor('--hum') }, min: 0, max: 100 },
         },
       },
-      scales: {
-        x: timeScaleOptions(range),
-        yTemp: {
-          type: 'linear',
-          position: 'left',
-          title: { display: true, text: '°C', color: '#ff7043', font: { size: 10 } },
-          grid:  { color: 'rgba(255,255,255,0.05)' },
-          ticks: { color: '#ff7043' },
-        },
-        yHum: {
-          type: 'linear',
-          position: 'right',
-          title: { display: true, text: '% HR', color: '#42a5f5', font: { size: 10 } },
-          grid:  { drawOnChartArea: false },
-          ticks: { color: '#42a5f5' },
-          min: 0,
-          max: 100,
-        },
-      },
-    },
-  });
-}
-
-// ── Actualizar resumen cards ───────────────────────────────────
-function updateSummaryCards(latest) {
-  if (!latest) return;
-  const m = latest.metrics || {};
-  valTemp.textContent = fmt(m.temperature_c);
-  valHum.textContent  = fmt(m.humidity, 0);
-  valPm1.textContent  = fmt(m.pm1);
-  valPm25.textContent = fmt(m.pm25);
-  valPm10.textContent = fmt(m.pm10);
-
-  if (latest.device_id) {
-    navDevice.textContent = latest.device_id;
+    });
   }
+  
+  if(toggles.temp) thChartInst.setDatasetVisibility(0, toggles.temp.checked);
+  if(toggles.hum) thChartInst.setDatasetVisibility(1, toggles.hum.checked);
+  thChartInst.update();
 }
 
 // ── Carga principal ───────────────────────────────────────────
-async function loadDashboard(range = currentRange) {
+async function loadData() {
   setOverlay(pmOverlay, true);
   setOverlay(thOverlay, true);
 
   try {
-    const [readings, latest] = await Promise.all([
-      fetchReadings(range),
-      fetchLatest(),
-    ]);
-
-    if (!readings || readings.length === 0) {
-      setStatus(false);
-      setOverlay(pmOverlay, false);
-      setOverlay(thOverlay, false);
-      currentReadings = [];
-      return;
+    if (!dbGlobalRange.min) {
+      const gRange = await fetchReadingsRange();
+      if (gRange) {
+        dbGlobalRange.min = timestampToLocal(gRange.min).getTime();
+        dbGlobalRange.max = timestampToLocal(gRange.max).getTime();
+      }
     }
 
-    currentReadings = readings;
+    const { start, end } = getWindowDates(currentRange, offsetUnits);
+    let readings = await getCachedReadings(start, end);
+    const latest = await fetchLatest();
+
+    btnNextRange.disabled = (offsetUnits === 0 || (dbGlobalRange.max && end.getTime() >= dbGlobalRange.max));
+    btnPrevRange.disabled = (dbGlobalRange.min && start.getTime() <= dbGlobalRange.min);
+
+    if (currentRange === '7d') {
+      readings = downsampleToHours(readings);
+    }
+
+    const ds = buildDatasets(readings || []); 
+    
+    renderPmChart(ds.labels, ds.pm1Data, ds.pm25Data, ds.pm10Data, currentRange, start, end);
+    renderThChart(ds.labels, ds.tempData, ds.humData, currentRange, start, end);
+
+    if (readings && readings.length > 0) {
+      const currentVal = offsetUnits === 0 ? latest : readings[readings.length - 1];
+      updateCards(currentVal, ds);
+    } else {
+      updateCards(latest || {}, { tempData:[], humData:[], pm1Data:[], pm25Data:[], pm10Data:[] });
+    }
+
+    if (latest && latest.device_id) {
+      navDevice.textContent = latest.device_id;
+    }
+
+    lastUpdated.textContent = `Última actualización: ${new Date().toLocaleTimeString('es-ES')}`;
     setStatus(true);
-    updateSummaryCards(latest || readings[readings.length - 1]);
 
-    const { labels, pm1Data, pm25Data, pm10Data, tempData, humData } = buildDatasets(readings);
-    renderPmChart(labels, pm1Data, pm25Data, pm10Data, range);
-    renderThChart(labels, tempData, humData, range);
-
-    lastUpdated.textContent = `Última actualización: ${new Date().toLocaleTimeString('es-CO', { hour: '2-digit', minute: '2-digit', second: '2-digit' })}`;
-  } catch (err) {
-    console.error('Error cargando dashboard:', err);
+  } catch (error) {
+    console.error(error);
     setStatus(false);
   } finally {
     setOverlay(pmOverlay, false);
@@ -292,75 +399,171 @@ async function loadDashboard(range = currentRange) {
   }
 }
 
-// ── Auto refresh ──────────────────────────────────────────────
-function startAutoRefresh() {
-  if (autoRefreshId) clearInterval(autoRefreshId);
-  autoRefreshId = setInterval(() => loadDashboard(currentRange), REFRESH_MS);
-}
+// ── Event Listeners ───────────────────────────────────────────
+updateChartTheme();
 
-// ── Eventos ───────────────────────────────────────────────────
 document.querySelectorAll('.tab-btn').forEach(btn => {
-  btn.addEventListener('click', () => {
+  btn.addEventListener('click', (e) => {
     document.querySelectorAll('.tab-btn').forEach(b => {
       b.classList.remove('active');
       b.setAttribute('aria-selected', 'false');
     });
-    btn.classList.add('active');
-    btn.setAttribute('aria-selected', 'true');
-    currentRange = btn.dataset.range;
-    loadDashboard(currentRange);
-    startAutoRefresh();
+    e.target.classList.add('active');
+    e.target.setAttribute('aria-selected', 'true');
+    
+    currentRange = e.target.getAttribute('data-range');
+    offsetUnits = 0; 
+    btnNextRange.disabled = true;
+    updatePaginationLabel();
+    
+    loadData();
   });
 });
 
+if (btnPrevRange) {
+  btnPrevRange.addEventListener('click', () => {
+    offsetUnits += 1;
+    btnNextRange.disabled = false;
+    loadData();
+  });
+}
+
+if (btnNextRange) {
+  btnNextRange.addEventListener('click', () => {
+    offsetUnits = Math.max(0, offsetUnits - 1);
+    if (offsetUnits === 0) btnNextRange.disabled = true;
+    loadData();
+  });
+}
+
 document.getElementById('btnRefresh').addEventListener('click', () => {
-  const btn = document.getElementById('btnRefresh');
-  btn.style.transform = 'rotate(360deg)';
-  btn.style.transition = 'transform 0.5s ease';
-  setTimeout(() => { btn.style.transform = ''; btn.style.transition = ''; }, 500);
-  loadDashboard(currentRange);
+  offsetUnits = 0;
+  btnNextRange.disabled = true;
+  loadData();
 });
 
 document.getElementById('btnLogout').addEventListener('click', logout);
 
-// ── Exportar CSV ──────────────────────────────────────────────
-document.getElementById('btnDownload').addEventListener('click', () => {
-  if (!currentReadings || currentReadings.length === 0) {
-    alert('No hay datos para descargar.');
-    return;
-  }
-  
-  // Crear cabecera
-  let csvContent = "data:text/csv;charset=utf-8,";
-  csvContent += "Timestamp,Dispositivo,Temp (C),Humedad (%),PM1,PM2.5,PM10\n";
-  
-  // Agregar filas
-  currentReadings.forEach(r => {
-    const ts = r.timestamp || '';
-    const dev = r.device_id || '';
-    const m = r.metrics || {};
-    const row = [
-      ts,
-      dev,
-      m.temperature_c ?? '',
-      m.humidity ?? '',
-      m.pm1 ?? '',
-      m.pm25 ?? '',
-      m.pm10 ?? ''
-    ].join(",");
-    csvContent += row + "\n";
+const btnTimezone = document.getElementById('btnTimezone');
+if (btnTimezone) {
+  btnTimezone.addEventListener('click', () => {
+    useLocalTime = !useLocalTime;
+    btnTimezone.textContent = useLocalTime ? 'Hora: Local (UTC-5)' : 'Hora: UTC';
+    cachedData = []; minCachedDate = null; maxCachedDate = null; dbGlobalRange = {min: null, max: null};
+    loadData();
   });
+}
+
+const btnThemeToggle = document.getElementById('btnThemeToggle');
+if (btnThemeToggle) {
+  btnThemeToggle.addEventListener('click', () => {
+    document.body.classList.toggle('light-mode');
+    updateChartTheme();
+    loadData();
+  });
+}
+
+const updateChartFromCheckboxes = () => {
+  const { start, end } = getWindowDates(currentRange, offsetUnits);
   
-  // Descargar archivo
-  const encodedUri = encodeURI(csvContent);
-  const link = document.createElement("a");
-  link.setAttribute("href", encodedUri);
-  link.setAttribute("download", `airlink_data_${currentRange}.csv`);
-  document.body.appendChild(link);
-  link.click();
-  document.body.removeChild(link);
+  if (thChartInst) {
+    thChartInst.setDatasetVisibility(0, toggles.temp.checked);
+    thChartInst.setDatasetVisibility(1, toggles.hum.checked);
+    thChartInst.options.scales.x = timeScaleOptions(currentRange, start, end);
+    thChartInst.update('none');
+  }
+  if (pmChartInst) {
+    pmChartInst.setDatasetVisibility(0, toggles.pm1.checked);
+    pmChartInst.setDatasetVisibility(1, toggles.pm25.checked);
+    pmChartInst.setDatasetVisibility(2, toggles.pm10.checked);
+    pmChartInst.options.scales.x = timeScaleOptions(currentRange, start, end);
+    pmChartInst.update('none');
+  }
+};
+
+['temp', 'hum', 'pm1', 'pm25', 'pm10'].forEach(key => {
+  if (toggles[key]) {
+    toggles[key].addEventListener('change', updateChartFromCheckboxes);
+  }
 });
 
-// ── Init ──────────────────────────────────────────────────────
-loadDashboard(currentRange);
+// ── Exportar CSV (Modal) ──────────────────────────────────────
+const downloadModal = document.getElementById('downloadModal');
+const btnDownloadModalOpen = document.getElementById('btnDownloadModalOpen');
+const closeDownloadModal = document.getElementById('closeDownloadModal');
+const startDateInput = document.getElementById('startDate');
+const endDateInput = document.getElementById('endDate');
+
+if (btnDownloadModalOpen && downloadModal) {
+  btnDownloadModalOpen.addEventListener('click', async () => {
+    downloadModal.classList.add('visible');
+    const range = await fetchReadingsRange();
+    if (range && range.min && range.max) {
+      const minD = new Date(range.min);
+      const maxD = new Date(range.max);
+      
+      const toLocalISO = (d) => {
+        const offset = d.getTimezoneOffset() * 60000;
+        return new Date(d.getTime() - offset).toISOString().slice(0, 16);
+      };
+
+      startDateInput.value = toLocalISO(minD);
+      endDateInput.value = toLocalISO(maxD);
+    }
+  });
+
+  closeDownloadModal.addEventListener('click', () => {
+    downloadModal.classList.remove('visible');
+  });
+
+  document.getElementById('btnConfirmDownload').addEventListener('click', async () => {
+    if (!startDateInput.value || !endDateInput.value) return;
+    try {
+      const startIso = new Date(startDateInput.value).toISOString();
+      const endIso = new Date(endDateInput.value).toISOString();
+      const data = await fetchReadings('custom', startIso, endIso);
+      
+      if (!data || data.length === 0) {
+        alert("No hay datos en el rango seleccionado.");
+        return;
+      }
+
+      const headers = ['Timestamp', 'Device_ID', 'Temp(C)', 'Hum(%)', 'PM1.0', 'PM2.5', 'PM10'];
+      const rows = data.map(r => {
+        const m = r.metrics || {};
+        return [
+          r.timestamp, r.device_id,
+          fmt(m.temperature_c), fmt(m.humidity),
+          fmt(m.pm1), fmt(m.pm25), fmt(m.pm10)
+        ].join(',');
+      });
+
+      const csvContent = [headers.join(','), ...rows].join('\n');
+      const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `airlink_data_${Date.now()}.csv`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      
+      downloadModal.classList.remove('visible');
+    } catch (e) {
+      console.error("Error downloading custom range:", e);
+      alert("Error al descargar los datos.");
+    }
+  });
+}
+
+// ── Iniciar auto-refresh ──────────────────────────────────────
+function startAutoRefresh() {
+  if (autoRefreshId) clearInterval(autoRefreshId);
+  autoRefreshId = setInterval(() => {
+    if (offsetUnits === 0) loadData(); // Solo autorefrescar si estamos viendo el "ahora"
+  }, REFRESH_MS);
+}
+
+updatePaginationLabel();
+loadData();
 startAutoRefresh();
