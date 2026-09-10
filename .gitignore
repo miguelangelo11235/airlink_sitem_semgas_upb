@@ -1,3 +1,7 @@
+# Ignorar todos los archivos Markdown excepto README.md
+*.md
+!README.md
+
 # Archivos de datos pesados / dumps locales
 air_quality.raw_measurements.json
 *.json.raw
