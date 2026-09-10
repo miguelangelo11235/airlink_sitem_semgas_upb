@@ -1,0 +1,16 @@
+# Archivos de datos pesados / dumps locales
+air_quality.raw_measurements.json
+*.json.raw
+*.csv
+
+# Archivos legados / backups
+legacy/
+*.backup
+*.tmp
+
+# Entorno y logs
+node_modules/
+.env
+.DS_Store
+Thumbs.db
+*.log

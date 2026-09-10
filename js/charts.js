@@ -79,10 +79,32 @@ function setStatus(online) {
 
 function timestampToLocal(ts) {
   if (!ts) return null;
-  let d = (typeof ts === 'object' && ts.$date) ? new Date(ts.$date) : new Date(ts);
-  if (useLocalTime) {
-    d = new Date(d.getTime() - (5 * 60 * 60 * 1000));
+  let raw = (typeof ts === 'object' && ts.$date) ? ts.$date : ts;
+  let d;
+  if (typeof raw === 'number') {
+    d = new Date(raw);
+  } else if (typeof raw === 'string') {
+    // Si la cadena no especifica zona horaria (ej: "2026-09-10T13:03:16"), añadir Z para parsear en UTC
+    let s = raw;
+    if (!s.endsWith('Z') && !s.includes('+') && !s.includes('-')) {
+      s += 'Z';
+    }
+    d = new Date(s);
+  } else if (raw instanceof Date) {
+    d = raw;
+  } else {
+    d = new Date(raw);
   }
+
+  if (isNaN(d.getTime())) return null;
+
+  if (!useLocalTime) {
+    // Si el usuario cambia a modo UTC, ajustar la representación a UTC
+    const utcMs = d.getTime() + (d.getTimezoneOffset() * 60000);
+    return new Date(utcMs);
+  }
+
+  // Por defecto: Hora Local (UTC-5)
   return d;
 }
 
@@ -195,20 +217,65 @@ async function getCachedReadings(startDt, endDt) {
   });
 }
 
+// ── Inserción de Marcas de Descontinuidad (> 2 Horas sin Datos) ─
+function processReadingsWithGaps(readings, maxGapMs = 7200000) {
+  if (!readings || readings.length === 0) return [];
+
+  const sorted = [...readings].sort((a, b) => {
+    const da = timestampToLocal(a.timestamp);
+    const db = timestampToLocal(b.timestamp);
+    return (da ? da.getTime() : 0) - (db ? db.getTime() : 0);
+  });
+
+  const result = [];
+  for (let i = 0; i < sorted.length; i++) {
+    const current = sorted[i];
+    const currentDate = timestampToLocal(current.timestamp);
+
+    if (i > 0) {
+      const prevDate = timestampToLocal(sorted[i - 1].timestamp);
+      if (prevDate && currentDate) {
+        const diffMs = currentDate.getTime() - prevDate.getTime();
+        if (diffMs > maxGapMs) {
+          // Insertar punto nulo 1 minuto después de la lectura anterior para romper la línea
+          const nullDate = new Date(prevDate.getTime() + 60000);
+          result.push({
+            timestamp: nullDate.toISOString(),
+            isGapMarker: true,
+            metrics: null
+          });
+        }
+      }
+    }
+    result.push(current);
+  }
+  return result;
+}
+
 // ── Construir datasets ────────────────────────────────────────
 function buildDatasets(readings) {
-  const labels = readings.map(r => timestampToLocal(r.timestamp));
-  const pm1Data  = readings.map(r => r.metrics?.pm1  ?? null);
-  const pm25Data = readings.map(r => r.metrics?.pm25  ?? null);
-  const pm10Data = readings.map(r => r.metrics?.pm10  ?? null);
-  const tempData = readings.map(r => r.metrics?.temperature_c ?? null);
-  const humData  = readings.map(r => r.metrics?.humidity ?? null);
+  const readingsWithGaps = processReadingsWithGaps(readings || [], 7200000);
+  const labels = readingsWithGaps.map(r => timestampToLocal(r.timestamp));
+  
+  const pm1Data  = readingsWithGaps.map(r => r.isGapMarker ? null : (r.metrics?.pm_1 ?? r.metrics?.pm1 ?? null));
+  const pm25Data = readingsWithGaps.map(r => r.isGapMarker ? null : (r.metrics?.pm_2p5 ?? r.metrics?.pm25 ?? null));
+  const pm10Data = readingsWithGaps.map(r => r.isGapMarker ? null : (r.metrics?.pm_10 ?? r.metrics?.pm10 ?? null));
+  
+  const tempData = readingsWithGaps.map(r => {
+    if (r.isGapMarker) return null;
+    let t = r.metrics?.temp ?? r.metrics?.temperature_c ?? null;
+    if (t !== null && t > 45) t = (t - 32) * 5 / 9;
+    return t;
+  });
+  
+  const humData  = readingsWithGaps.map(r => r.isGapMarker ? null : (r.metrics?.hum ?? r.metrics?.humidity ?? null));
+  
   return { labels, pm1Data, pm25Data, pm10Data, tempData, humData };
 }
 
 // ── Actualizar KPIs ───────────────────────────────────────────
 function getMinMax(arr) {
-  const valid = arr.filter(v => v !== null);
+  const valid = arr.filter(v => v !== null && v !== undefined && !isNaN(v));
   if (valid.length === 0) return { min: '—', max: '—' };
   return { min: Math.min(...valid), max: Math.max(...valid) };
 }
@@ -216,8 +283,15 @@ function getMinMax(arr) {
 function updateCards(latestReading, datasets) {
   if (!latestReading) return;
   const m = latestReading.metrics || {};
-  valTemp.textContent  = fmt(m.temperature_c); valHum.textContent   = fmt(m.humidity);
-  valPm1.textContent   = fmt(m.pm1); valPm25.textContent  = fmt(m.pm25); valPm10.textContent  = fmt(m.pm10);
+  let tempVal = m.temp ?? m.temperature_c ?? null;
+  if (tempVal !== null && tempVal > 45) tempVal = (tempVal - 32) * 5 / 9;
+  const humVal = m.hum ?? m.humidity ?? null;
+  const pm1Val = m.pm_1 ?? m.pm1 ?? null;
+  const pm25Val = m.pm_2p5 ?? m.pm25 ?? null;
+  const pm10Val = m.pm_10 ?? m.pm10 ?? null;
+
+  valTemp.textContent  = fmt(tempVal); valHum.textContent   = fmt(humVal);
+  valPm1.textContent   = fmt(pm1Val); valPm25.textContent  = fmt(pm25Val); valPm10.textContent  = fmt(pm10Val);
 
   const tm = getMinMax(datasets.tempData);
   minTemp.textContent = fmt(tm.min); maxTemp.textContent = fmt(tm.max);
@@ -587,13 +661,44 @@ if (btnDownloadModalOpen && downloadModal) {
         return;
       }
 
-      const headers = ['Timestamp', 'Device_ID', 'Temp(C)', 'Hum(%)', 'PM1.0', 'PM2.5', 'PM10'];
+      const headers = [
+        'Timestamp', 'Device_ID', 'Location', 'Quality',
+        'Temp(C)', 'Humidity(%)', 'Dew_Point(C)', 'Wet_Bulb(C)', 'Heat_Index(C)',
+        'PM1.0(µg/m³)', 'PM2.5(µg/m³)', 'PM10(µg/m³)',
+        'PM2.5_1h(µg/m³)', 'PM2.5_3h(µg/m³)', 'PM2.5_24h(µg/m³)',
+        'PM10_1h(µg/m³)', 'PM10_3h(µg/m³)', 'PM10_24h(µg/m³)'
+      ];
+
       const rows = data.map(r => {
         const m = r.metrics || {};
+        let t = m.temp ?? m.temperature_c ?? null;
+        if (t !== null && t > 45) t = (t - 32) * 5 / 9;
+        let dp = m.dew_point ?? null;
+        if (dp !== null && dp > 45) dp = (dp - 32) * 5 / 9;
+        let wb = m.wet_bulb ?? null;
+        if (wb !== null && wb > 45) wb = (wb - 32) * 5 / 9;
+        let hi = m.heat_index ?? null;
+        if (hi !== null && hi > 45) hi = (hi - 32) * 5 / 9;
+
         return [
-          r.timestamp, r.device_id,
-          fmt(m.temperature_c), fmt(m.humidity),
-          fmt(m.pm1), fmt(m.pm25), fmt(m.pm10)
+          r.timestamp,
+          `"${r.device_id || m.name || 'Airlink_SITEM_SEMGAS'}"`,
+          `"${r.location || m.location || 'Polideportivo - Boulevard P1'}"`,
+          `"${r.quality || m.quality || 'ok'}"`,
+          fmt(t),
+          fmt(m.hum ?? m.humidity),
+          fmt(dp),
+          fmt(wb),
+          fmt(hi),
+          fmt(m.pm_1 ?? m.pm1),
+          fmt(m.pm_2p5 ?? m.pm25),
+          fmt(m.pm_10 ?? m.pm10),
+          fmt(m.pm_2p5_last_1_hour),
+          fmt(m.pm_2p5_last_3_hours),
+          fmt(m.pm_2p5_last_24_hours),
+          fmt(m.pm_10_last_1_hour),
+          fmt(m.pm_10_last_3_hours),
+          fmt(m.pm_10_last_24_hours)
         ].join(',');
       });
 
@@ -602,7 +707,7 @@ if (btnDownloadModalOpen && downloadModal) {
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;
-      a.download = `airlink_data_${Date.now()}.csv`;
+      a.download = `airlink_historical_data_${Date.now()}.csv`;
       document.body.appendChild(a);
       a.click();
       document.body.removeChild(a);
